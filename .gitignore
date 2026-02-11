@@ -68,3 +68,7 @@ Thumbs.db
 # Misc
 backup_env/
 nul
+
+# Utility scripts with secrets
+python_embed.py
+python_llm.py
