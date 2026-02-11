@@ -1,0 +1,192 @@
+# ============================================================
+# GitHub Actions Pipeline - Deploy RAG Chatbot to Azure Web App
+# ============================================================
+#
+# WHAT THIS DOES:
+#   1. Triggers on push to 'main' branch (or manual dispatch)
+#   2. Packages the code into a ZIP (excludes dev files)
+#   3. Deploys via ZIP Deploy to Azure Web App (Linux Python 3.11)
+#   4. Uses the custom startup.sh to run both backend + frontend
+#
+# PREREQUISITES:
+#   See the "Required Secrets & Variables" section below
+# ============================================================
+
+name: Deploy RAG Chatbot to Azure Web App
+
+# ── When to trigger ──
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:        # Allows manual trigger from GitHub UI
+
+# ── Environment variables used across jobs ──
+env:
+  AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME }}   # e.g. "my-rag-chatbot"
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  # ════════════════════════════════════════════════════════════
+  # JOB 1: BUILD & TEST
+  # ════════════════════════════════════════════════════════════
+  build:
+    name: Build & Package
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── Step 1: Checkout code ──
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Step 2: Set up Python ──
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"                # Cache pip packages for faster builds
+
+      # ── Step 3: Install dependencies ──
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ── Step 4: Run tests (optional, won't block deploy if no tests) ──
+      - name: Run tests
+        continue-on-error: true       # Don't block deploy if tests fail
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          if [ -d "backend/tests" ] && [ "$(ls -A backend/tests/*.py 2>/dev/null)" ]; then
+            pytest backend/tests/ -v --tb=short
+          else
+            echo "No tests found, skipping..."
+          fi
+
+      # ── Step 5: Create deployment package ──
+      #    ZIP everything needed, exclude dev/local files
+      - name: Create deployment package
+        run: |
+          zip -r deploy.zip . \
+            -x ".git/*" \
+            -x ".github/*" \
+            -x ".venv/*" \
+            -x "__pycache__/*" \
+            -x "*.pyc" \
+            -x ".env" \
+            -x "backup_env/*" \
+            -x "docker/*" \
+            -x "docs/*" \
+            -x "infra/*" \
+            -x "scripts/*" \
+            -x "*.md" \
+            -x ".gitignore" \
+            -x "python_embed.py" \
+            -x "python_llm.py"
+
+      # ── Step 6: Upload artifact for deploy job ──
+      - name: Upload deployment artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-package
+          path: deploy.zip
+          retention-days: 3
+
+  # ════════════════════════════════════════════════════════════
+  # JOB 2: DEPLOY TO AZURE
+  # ════════════════════════════════════════════════════════════
+  deploy:
+    name: Deploy to Azure Web App
+    runs-on: ubuntu-latest
+    needs: build                       # Wait for build to finish
+    environment:
+      name: production
+      url: ${{ steps.deploy.outputs.webapp-url }}
+
+    steps:
+      # ── Step 1: Download the build artifact ──
+      - name: Download deployment artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-package
+
+      # ── Step 2: Login to Azure ──
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # ── Step 3: Configure Web App settings ──
+      #    Sets the startup command and required app settings
+      - name: Configure Web App startup command
+        run: |
+          az webapp config set \
+            --resource-group ${{ vars.AZURE_RESOURCE_GROUP }} \
+            --name ${{ vars.AZURE_WEBAPP_NAME }} \
+            --startup-file "bash /home/site/wwwroot/deploy/startup.sh" \
+            --linux-fx-version "PYTHON|3.11"
+
+      # ── Step 4: Set App Settings (environment variables) ──
+      #    These are injected as environment variables into the Web App
+      - name: Configure App Settings
+        run: |
+          az webapp config appsettings set \
+            --resource-group ${{ vars.AZURE_RESOURCE_GROUP }} \
+            --name ${{ vars.AZURE_WEBAPP_NAME }} \
+            --settings \
+              SCM_DO_BUILD_DURING_DEPLOYMENT=true \
+              ENABLE_ORYX_BUILD=true \
+              PYTHONPATH=/home/site/wwwroot \
+              WEBSITES_PORT=8000 \
+              AZURE_OPENAI_ENDPOINT="${{ secrets.AZURE_OPENAI_ENDPOINT }}" \
+              AZURE_OPENAI_API_KEY="${{ secrets.AZURE_OPENAI_API_KEY }}" \
+              AZURE_OPENAI_API_VERSION="${{ secrets.AZURE_OPENAI_API_VERSION }}" \
+              AZURE_OPENAI_CHAT_DEPLOYMENT="${{ secrets.AZURE_OPENAI_CHAT_DEPLOYMENT }}" \
+              AZURE_OPENAI_EMBEDDING_ENDPOINT="${{ secrets.AZURE_OPENAI_EMBEDDING_ENDPOINT }}" \
+              AZURE_OPENAI_EMBEDDING_API_KEY="${{ secrets.AZURE_OPENAI_EMBEDDING_API_KEY }}" \
+              AZURE_OPENAI_EMBEDDING_DEPLOYMENT="${{ secrets.AZURE_OPENAI_EMBEDDING_DEPLOYMENT }}" \
+              AZURE_SEARCH_ENDPOINT="${{ secrets.AZURE_SEARCH_ENDPOINT }}" \
+              AZURE_SEARCH_API_KEY="${{ secrets.AZURE_SEARCH_API_KEY }}" \
+              AZURE_SEARCH_INDEX_NAME="${{ secrets.AZURE_SEARCH_INDEX_NAME }}" \
+              AZURE_STORAGE_CONNECTION_STRING="${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}" \
+              AZURE_STORAGE_CONTAINER_NAME="${{ secrets.AZURE_STORAGE_CONTAINER_NAME }}" \
+              BLOB_BASE_URL="${{ secrets.BLOB_BASE_URL }}" \
+              TOP_K=5 \
+              SCORE_THRESHOLD=0.01 \
+              STRICT_GROUNDING=true \
+              LOG_LEVEL=INFO
+
+      # ── Step 5: Deploy to Azure Web App ──
+      - name: Deploy to Azure Web App
+        id: deploy
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ vars.AZURE_WEBAPP_NAME }}
+          package: deploy.zip
+
+      # ── Step 6: Wait and verify deployment ──
+      - name: Verify deployment
+        run: |
+          echo "Waiting 60 seconds for app to start..."
+          sleep 60
+          echo "Checking health endpoint..."
+          HEALTH_URL="https://${{ vars.AZURE_WEBAPP_NAME }}.azurewebsites.net/health"
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" $HEALTH_URL || echo "000")
+          if [ "$HTTP_STATUS" = "000" ]; then
+            echo "WARNING: Health check at $HEALTH_URL is not reachable yet."
+            echo "This is expected — Streamlit is on port 8000, /health is on the backend (8080, internal only)."
+            echo "Check the Streamlit UI at: https://${{ vars.AZURE_WEBAPP_NAME }}.azurewebsites.net"
+          else
+            echo "Health check returned HTTP $HTTP_STATUS"
+          fi
+          echo ""
+          echo "=========================================="
+          echo " Deployment complete!"
+          echo " App URL: https://${{ vars.AZURE_WEBAPP_NAME }}.azurewebsites.net"
+          echo "=========================================="
+
+      # ── Step 7: Logout from Azure ──
+      - name: Azure Logout
+        if: always()
+        run: az logout

@@ -13,15 +13,6 @@ Enterprise-grade Retrieval-Augmented Generation (RAG) chatbot using Azure Blob S
 - FastAPI backend with health endpoints
 - Azure App Service deployment ready
 
-## Architecture
-
-```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   Streamlit UI  │────▶│  FastAPI Backend │────▶│  Azure Services │
-│   (Port 8501)   │◀────│   (Port 8000)    │◀────│                 │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
-```
-
 ## Prerequisites
 
 ### Azure Resources
