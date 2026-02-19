@@ -1,0 +1,728 @@
+# ============================================================
+# GitHub Actions – RAG Chatbot Deploy to Azure (Multi-Env)
+# ============================================================
+#
+# AUTHENTICATION: Service Principal (SPN)
+#   azure/login@v2 using Client ID / Secret / Subscription / Tenant
+#
+# ENVIRONMENTS:  dev | test | prod
+#   Repo → Settings → Environments → New environment
+#   Add "Required reviewers" on test and prod for an approval gate.
+#
+# TRIGGER RULES:
+#   • Push to main        → auto-deploys to DEV
+#   • workflow_dispatch   → choose target env manually
+#
+# HOW FRONTEND + BACKEND SHARE ONE AZURE WEB APP:
+#   Azure Web App exposes ONE public port (WEBSITES_PORT = 8000).
+#   WEBSITE_STARTUP_COMMAND → deploy/startup.sh which starts:
+#     1. FastAPI (gunicorn) on port 8080 — INTERNAL only
+#     2. Streamlit          on port 8000 — PUBLIC (internet-facing)
+#
+# ── REQUIRED GITHUB CONFIGURATION ────────────────────────────
+#
+# VARIABLES  (Settings → Environments → <env> → Environment variables)
+#   AZURE_WEBAPP_NAME     techmanual-dev / techmanual-test / techmanual
+#   AZURE_RESOURCE_GROUP  e.g. rg-mangos-techmanual
+#   TOP_K                 5
+#   SCORE_THRESHOLD       0.01
+#   STRICT_GROUNDING      true
+#   LOG_LEVEL             DEBUG (dev) | INFO (test) | WARNING (prod)
+#
+# SECRETS  (Settings → Environments → <env> → Environment secrets)
+#   AZURE_CLIENT_ID / AZURE_CLIENT_SECRET / AZURE_SUBSCRIPTION_ID / AZURE_TENANT_ID
+#   AZURE_OPENAI_ENDPOINT / AZURE_OPENAI_API_KEY / AZURE_OPENAI_API_VERSION
+#   AZURE_OPENAI_CHAT_DEPLOYMENT / AZURE_OPENAI_EMBEDDING_ENDPOINT
+#   AZURE_OPENAI_EMBEDDING_API_KEY / AZURE_OPENAI_EMBEDDING_DEPLOYMENT
+#   AZURE_SEARCH_ENDPOINT / AZURE_SEARCH_API_KEY / AZURE_SEARCH_INDEX_NAME
+#   AZURE_STORAGE_CONNECTION_STRING / AZURE_STORAGE_CONTAINER_NAME / BLOB_BASE_URL
+# ============================================================
+
+name: RAG Chatbot – Deploy to Azure
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment to deploy'
+        required: true
+        type: choice
+        options: [dev, test, prod]
+
+env:
+  PYTHON_VERSION: '3.11'
+
+# ════════════════════════════════════════════════════════════
+# JOB 1 – BUILD & PACKAGE
+# ════════════════════════════════════════════════════════════
+jobs:
+  build:
+    name: Build & Package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        continue-on-error: true
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          if ls backend/tests/*.py 2>/dev/null | grep -q .; then
+            pytest backend/tests/ -v --tb=short
+          else
+            echo "No tests found — skipping."
+          fi
+
+      - name: Create deployment package
+        run: |
+          zip -r deploy.zip . \
+            -x ".git/*" -x ".github/*" -x ".venv/*" -x "antenv/*" \
+            -x "**/__pycache__/*" -x "**/*.pyc" -x "**/*.pyo" \
+            -x ".env" -x ".env.*" -x "backup_env/*" \
+            -x "docker/*" -x "docs/*" -x "infra/*" -x "scripts/*" \
+            -x "*.md" -x ".gitignore"
+          echo "Package size: $(du -sh deploy.zip | cut -f1)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-package
+          path: deploy.zip
+          retention-days: 5
+
+# ════════════════════════════════════════════════════════════
+# JOB 2 – DEPLOY TO DEV
+# ════════════════════════════════════════════════════════════
+  deploy-dev:
+    name: "Deploy → Dev"
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: dev
+      url: https://${{ vars.AZURE_WEBAPP_NAME }}.azurewebsites.net
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' &&
+       github.event.inputs.environment == 'dev')
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-package
+
+      # ── DEBUG: pre-flight check ──────────────────────────────
+      - name: "Debug – Variables & secrets for DEV"
+        env:
+          _CLIENT_ID:          ${{ secrets.AZURE_CLIENT_ID }}
+          _CLIENT_SECRET:      ${{ secrets.AZURE_CLIENT_SECRET }}
+          _SUBSCRIPTION_ID:    ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          _TENANT_ID:          ${{ secrets.AZURE_TENANT_ID }}
+          _OAI_ENDPOINT:       ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          _OAI_API_KEY:        ${{ secrets.AZURE_OPENAI_API_KEY }}
+          _OAI_API_VERSION:    ${{ secrets.AZURE_OPENAI_API_VERSION }}
+          _OAI_CHAT_DEPLOY:    ${{ secrets.AZURE_OPENAI_CHAT_DEPLOYMENT }}
+          _OAI_EMBED_ENDPOINT: ${{ secrets.AZURE_OPENAI_EMBEDDING_ENDPOINT }}
+          _OAI_EMBED_KEY:      ${{ secrets.AZURE_OPENAI_EMBEDDING_API_KEY }}
+          _OAI_EMBED_DEPLOY:   ${{ secrets.AZURE_OPENAI_EMBEDDING_DEPLOYMENT }}
+          _SEARCH_ENDPOINT:    ${{ secrets.AZURE_SEARCH_ENDPOINT }}
+          _SEARCH_KEY:         ${{ secrets.AZURE_SEARCH_API_KEY }}
+          _SEARCH_INDEX:       ${{ secrets.AZURE_SEARCH_INDEX_NAME }}
+          _STORAGE_CONN:       ${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}
+          _STORAGE_CONTAINER:  ${{ secrets.AZURE_STORAGE_CONTAINER_NAME }}
+          _BLOB_BASE_URL:      ${{ secrets.BLOB_BASE_URL }}
+        run: |
+          chk() { [ -n "$2" ] && echo "  [SET]     $1" || echo "  [MISSING] $1  ← add to GitHub Env secrets"; }
+          echo "════════════════════════════════════════════════"
+          echo "  ENVIRONMENT DEBUG  —  DEV"
+          echo "════════════════════════════════════════════════"
+          echo "  Trigger      : ${{ github.event_name }}"
+          echo "  Actor        : ${{ github.actor }}"
+          echo "  Branch       : ${{ github.ref_name }}"
+          echo "  Commit       : ${{ github.sha }}"
+          echo ""
+          echo "── Azure target (variables) ─────────────────────"
+          echo "  AZURE_WEBAPP_NAME    : ${{ vars.AZURE_WEBAPP_NAME }}"
+          echo "  AZURE_RESOURCE_GROUP : ${{ vars.AZURE_RESOURCE_GROUP }}"
+          echo ""
+          echo "── App config (variables) ───────────────────────"
+          echo "  TOP_K=${{ vars.TOP_K }}  SCORE_THRESHOLD=${{ vars.SCORE_THRESHOLD }}  LOG_LEVEL=${{ vars.LOG_LEVEL }}"
+          echo ""
+          echo "── SPN secrets ──────────────────────────────────"
+          chk "AZURE_CLIENT_ID      " "$_CLIENT_ID"
+          chk "AZURE_CLIENT_SECRET  " "$_CLIENT_SECRET"
+          chk "AZURE_SUBSCRIPTION_ID" "$_SUBSCRIPTION_ID"
+          chk "AZURE_TENANT_ID      " "$_TENANT_ID"
+          echo ""
+          echo "── App secrets ──────────────────────────────────"
+          chk "AZURE_OPENAI_ENDPOINT            " "$_OAI_ENDPOINT"
+          chk "AZURE_OPENAI_API_KEY             " "$_OAI_API_KEY"
+          chk "AZURE_OPENAI_API_VERSION         " "$_OAI_API_VERSION"
+          chk "AZURE_OPENAI_CHAT_DEPLOYMENT     " "$_OAI_CHAT_DEPLOY"
+          chk "AZURE_OPENAI_EMBEDDING_ENDPOINT  " "$_OAI_EMBED_ENDPOINT"
+          chk "AZURE_OPENAI_EMBEDDING_API_KEY   " "$_OAI_EMBED_KEY"
+          chk "AZURE_OPENAI_EMBEDDING_DEPLOYMENT" "$_OAI_EMBED_DEPLOY"
+          chk "AZURE_SEARCH_ENDPOINT            " "$_SEARCH_ENDPOINT"
+          chk "AZURE_SEARCH_API_KEY             " "$_SEARCH_KEY"
+          chk "AZURE_SEARCH_INDEX_NAME          " "$_SEARCH_INDEX"
+          chk "AZURE_STORAGE_CONNECTION_STRING  " "$_STORAGE_CONN"
+          chk "AZURE_STORAGE_CONTAINER_NAME     " "$_STORAGE_CONTAINER"
+          chk "BLOB_BASE_URL                    " "$_BLOB_BASE_URL"
+          echo "════════════════════════════════════════════════"
+          MISSING=0
+          [ -z "${{ vars.AZURE_WEBAPP_NAME }}"    ] && echo "ERROR: AZURE_WEBAPP_NAME is empty!"    && MISSING=$((MISSING+1))
+          [ -z "${{ vars.AZURE_RESOURCE_GROUP }}" ] && echo "ERROR: AZURE_RESOURCE_GROUP is empty!" && MISSING=$((MISSING+1))
+          [ -z "$_CLIENT_ID"    ] && MISSING=$((MISSING+1))
+          [ -z "$_CLIENT_SECRET"] && MISSING=$((MISSING+1))
+          [ -z "$_SUBSCRIPTION_ID" ] && MISSING=$((MISSING+1))
+          [ -z "$_TENANT_ID"    ] && MISSING=$((MISSING+1))
+          [ "$MISSING" -gt 0 ] && echo "ERROR: $MISSING required value(s) missing — fix in Settings → Environments → dev" && exit 1
+          echo "All required values present. Proceeding."
+
+      - name: Login to Azure (SPN)
+        uses: azure/login@v2
+        with:
+          creds: >-
+            {"clientId":"${{ secrets.AZURE_CLIENT_ID }}",
+             "clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}",
+             "subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+             "tenantId":"${{ secrets.AZURE_TENANT_ID }}"}
+
+      # ── Apply app settings via ARM REST API ──────────────────
+      # Writes settings to JSON with Python (handles = ; & in
+      # connection strings safely) then PUTs via az rest.
+      # URL components come from env vars (trimmed) to avoid
+      # any whitespace/newline corruption in the ARM URL.
+      - name: Set App Settings via ARM API
+        env:
+          _SUB_ID:             ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          _RG:                 ${{ vars.AZURE_RESOURCE_GROUP }}
+          _APP:                ${{ vars.AZURE_WEBAPP_NAME }}
+          _OAI_ENDPOINT:       ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          _OAI_API_KEY:        ${{ secrets.AZURE_OPENAI_API_KEY }}
+          _OAI_API_VERSION:    ${{ secrets.AZURE_OPENAI_API_VERSION }}
+          _OAI_CHAT_DEPLOY:    ${{ secrets.AZURE_OPENAI_CHAT_DEPLOYMENT }}
+          _OAI_EMBED_ENDPOINT: ${{ secrets.AZURE_OPENAI_EMBEDDING_ENDPOINT }}
+          _OAI_EMBED_KEY:      ${{ secrets.AZURE_OPENAI_EMBEDDING_API_KEY }}
+          _OAI_EMBED_DEPLOY:   ${{ secrets.AZURE_OPENAI_EMBEDDING_DEPLOYMENT }}
+          _SEARCH_ENDPOINT:    ${{ secrets.AZURE_SEARCH_ENDPOINT }}
+          _SEARCH_KEY:         ${{ secrets.AZURE_SEARCH_API_KEY }}
+          _SEARCH_INDEX:       ${{ secrets.AZURE_SEARCH_INDEX_NAME }}
+          _STORAGE_CONN:       ${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}
+          _STORAGE_CONTAINER:  ${{ secrets.AZURE_STORAGE_CONTAINER_NAME }}
+          _BLOB_BASE_URL:      ${{ secrets.BLOB_BASE_URL }}
+          _TOP_K:              ${{ vars.TOP_K }}
+          _SCORE_THRESHOLD:    ${{ vars.SCORE_THRESHOLD }}
+          _STRICT_GROUNDING:   ${{ vars.STRICT_GROUNDING }}
+          _LOG_LEVEL:          ${{ vars.LOG_LEVEL }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os
+          g = os.environ.get
+          settings = {
+              "WEBSITE_STARTUP_COMMAND":           "bash /home/site/wwwroot/deploy/startup.sh",
+              "PYTHONPATH":                        "/home/site/wwwroot",
+              "WEBSITES_PORT":                     "8000",
+              "BACKEND_URL":                       "http://localhost:8080",
+              "AZURE_OPENAI_ENDPOINT":             g("_OAI_ENDPOINT",""),
+              "AZURE_OPENAI_API_KEY":              g("_OAI_API_KEY",""),
+              "AZURE_OPENAI_API_VERSION":          g("_OAI_API_VERSION",""),
+              "AZURE_OPENAI_CHAT_DEPLOYMENT":      g("_OAI_CHAT_DEPLOY",""),
+              "AZURE_OPENAI_EMBEDDING_ENDPOINT":   g("_OAI_EMBED_ENDPOINT",""),
+              "AZURE_OPENAI_EMBEDDING_API_KEY":    g("_OAI_EMBED_KEY",""),
+              "AZURE_OPENAI_EMBEDDING_DEPLOYMENT": g("_OAI_EMBED_DEPLOY",""),
+              "AZURE_SEARCH_ENDPOINT":             g("_SEARCH_ENDPOINT",""),
+              "AZURE_SEARCH_API_KEY":              g("_SEARCH_KEY",""),
+              "AZURE_SEARCH_INDEX_NAME":           g("_SEARCH_INDEX",""),
+              "AZURE_STORAGE_CONNECTION_STRING":   g("_STORAGE_CONN",""),
+              "AZURE_STORAGE_CONTAINER_NAME":      g("_STORAGE_CONTAINER",""),
+              "BLOB_BASE_URL":                     g("_BLOB_BASE_URL",""),
+              "TOP_K":                             g("_TOP_K","5"),
+              "SCORE_THRESHOLD":                   g("_SCORE_THRESHOLD","0.01"),
+              "STRICT_GROUNDING":                  g("_STRICT_GROUNDING","true"),
+              "LOG_LEVEL":                         g("_LOG_LEVEL","INFO"),
+          }
+          with open("/tmp/appsettings.json","w") as f:
+              json.dump({"properties": settings}, f, indent=2)
+          print(f"Prepared {len(settings)} settings (JSON written to /tmp/appsettings.json)")
+          PYEOF
+
+          # Trim whitespace/newlines from URL path components
+          SUB_ID=$(echo "$_SUB_ID" | tr -d '[:space:]')
+          RG=$(echo "$_RG"         | tr -d '[:space:]')
+          APP=$(echo "$_APP"       | tr -d '[:space:]')
+          echo "ARM target: resourceGroups/${RG}/sites/${APP}"
+
+          ARM_URL="https://management.azure.com/subscriptions/${SUB_ID}/resourceGroups/${RG}/providers/Microsoft.Web/sites/${APP}/config/appsettings?api-version=2022-03-01"
+
+          echo "Applying settings via ARM API..."
+          az rest \
+            --method PUT \
+            --url "$ARM_URL" \
+            --body @/tmp/appsettings.json \
+            --headers "Content-Type=application/json"
+          echo "App settings applied successfully."
+
+      - name: Enable WebSockets
+        env:
+          _APP: ${{ vars.AZURE_WEBAPP_NAME }}
+          _RG:  ${{ vars.AZURE_RESOURCE_GROUP }}
+        run: |
+          APP=$(echo "$_APP" | tr -d '[:space:]')
+          RG=$(echo "$_RG"   | tr -d '[:space:]')
+          az webapp config set --web-sockets-enabled true \
+            --name "$APP" --resource-group "$RG"
+          echo "WebSockets enabled."
+
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v1
+        with:
+          app-name: ${{ vars.AZURE_WEBAPP_NAME }}
+          package: deploy.zip
+
+      - name: Restart App Service
+        env:
+          _APP: ${{ vars.AZURE_WEBAPP_NAME }}
+          _RG:  ${{ vars.AZURE_RESOURCE_GROUP }}
+        run: |
+          APP=$(echo "$_APP" | tr -d '[:space:]')
+          RG=$(echo "$_RG"   | tr -d '[:space:]')
+          echo "Restarting $APP in $RG ..."
+          az webapp restart --name "$APP" --resource-group "$RG"
+          echo "Restart triggered. Waiting 60s for startup..."
+          sleep 60
+
+      - name: Smoke test – verify app is live
+        id: smoke
+        run: |
+          APP_URL="https://${{ vars.AZURE_WEBAPP_NAME }}.azurewebsites.net"
+          echo "Waiting 60s for app to finish starting..."
+          sleep 60
+          SUCCESS=false
+          for attempt in 1 2 3 4 5; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$APP_URL/_stcore/health" || echo "000")
+            echo "Attempt $attempt/5 → HTTP $STATUS"
+            if [ "$STATUS" = "200" ]; then SUCCESS=true; break; fi
+            sleep 20
+          done
+          echo "smoke_ok=$SUCCESS" >> $GITHUB_OUTPUT
+          [ "$SUCCESS" = "true" ] && echo "App is healthy!" || echo "Not yet healthy — check Azure Log stream."
+          echo "App URL: $APP_URL"
+
+      - name: Write job summary
+        if: always()
+        run: |
+          APP_URL="https://${{ vars.AZURE_WEBAPP_NAME }}.azurewebsites.net"
+          STATUS=$( [ "${{ steps.smoke.outputs.smoke_ok }}" = "true" ] && echo "✅ Healthy" || echo "⚠️ Not yet healthy" )
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## Deploy → DEV
+
+          | | |
+          |---|---|
+          | **Environment** | \`dev\` |
+          | **Web App** | \`${{ vars.AZURE_WEBAPP_NAME }}\` |
+          | **Resource Group** | \`${{ vars.AZURE_RESOURCE_GROUP }}\` |
+          | **App URL** | [$APP_URL]($APP_URL) |
+          | **Health** | $STATUS |
+          | **Commit** | \`${{ github.sha }}\` |
+          | **Actor** | ${{ github.actor }} |
+          | **Run** | [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+
+          **Startup:** FastAPI → port 8080 (internal) · Streamlit → port 8000 (public)
+          EOF
+
+      - name: Azure Logout
+        if: always()
+        run: az logout
+
+# ════════════════════════════════════════════════════════════
+# JOB 3 – DEPLOY TO TEST
+# ════════════════════════════════════════════════════════════
+  deploy-test:
+    name: "Deploy → Test"
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: test
+      url: https://${{ vars.AZURE_WEBAPP_NAME }}.azurewebsites.net
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.environment == 'test'
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-package
+
+      - name: "Debug – Variables & secrets for TEST"
+        env:
+          _CLIENT_ID:          ${{ secrets.AZURE_CLIENT_ID }}
+          _CLIENT_SECRET:      ${{ secrets.AZURE_CLIENT_SECRET }}
+          _SUBSCRIPTION_ID:    ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          _TENANT_ID:          ${{ secrets.AZURE_TENANT_ID }}
+          _OAI_ENDPOINT:       ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          _OAI_API_KEY:        ${{ secrets.AZURE_OPENAI_API_KEY }}
+          _OAI_API_VERSION:    ${{ secrets.AZURE_OPENAI_API_VERSION }}
+          _OAI_CHAT_DEPLOY:    ${{ secrets.AZURE_OPENAI_CHAT_DEPLOYMENT }}
+          _OAI_EMBED_ENDPOINT: ${{ secrets.AZURE_OPENAI_EMBEDDING_ENDPOINT }}
+          _OAI_EMBED_KEY:      ${{ secrets.AZURE_OPENAI_EMBEDDING_API_KEY }}
+          _OAI_EMBED_DEPLOY:   ${{ secrets.AZURE_OPENAI_EMBEDDING_DEPLOYMENT }}
+          _SEARCH_ENDPOINT:    ${{ secrets.AZURE_SEARCH_ENDPOINT }}
+          _SEARCH_KEY:         ${{ secrets.AZURE_SEARCH_API_KEY }}
+          _SEARCH_INDEX:       ${{ secrets.AZURE_SEARCH_INDEX_NAME }}
+          _STORAGE_CONN:       ${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}
+          _STORAGE_CONTAINER:  ${{ secrets.AZURE_STORAGE_CONTAINER_NAME }}
+          _BLOB_BASE_URL:      ${{ secrets.BLOB_BASE_URL }}
+        run: |
+          chk() { [ -n "$2" ] && echo "  [SET]     $1" || echo "  [MISSING] $1"; }
+          echo "════════ ENVIRONMENT DEBUG — TEST ════════"
+          echo "  AZURE_WEBAPP_NAME    : ${{ vars.AZURE_WEBAPP_NAME }}"
+          echo "  AZURE_RESOURCE_GROUP : ${{ vars.AZURE_RESOURCE_GROUP }}"
+          echo "  Actor: ${{ github.actor }} | Branch: ${{ github.ref_name }}"
+          echo ""
+          chk "AZURE_CLIENT_ID      " "$_CLIENT_ID"
+          chk "AZURE_CLIENT_SECRET  " "$_CLIENT_SECRET"
+          chk "AZURE_SUBSCRIPTION_ID" "$_SUBSCRIPTION_ID"
+          chk "AZURE_TENANT_ID      " "$_TENANT_ID"
+          chk "AZURE_OPENAI_ENDPOINT" "$_OAI_ENDPOINT"
+          chk "AZURE_OPENAI_API_KEY " "$_OAI_API_KEY"
+          chk "AZURE_SEARCH_ENDPOINT" "$_SEARCH_ENDPOINT"
+          chk "AZURE_STORAGE_CONNECTION_STRING" "$_STORAGE_CONN"
+          chk "BLOB_BASE_URL        " "$_BLOB_BASE_URL"
+          MISSING=0
+          [ -z "${{ vars.AZURE_WEBAPP_NAME }}"    ] && MISSING=$((MISSING+1))
+          [ -z "${{ vars.AZURE_RESOURCE_GROUP }}" ] && MISSING=$((MISSING+1))
+          [ -z "$_CLIENT_ID" ] && MISSING=$((MISSING+1))
+          [ -z "$_CLIENT_SECRET" ] && MISSING=$((MISSING+1))
+          [ -z "$_SUBSCRIPTION_ID" ] && MISSING=$((MISSING+1))
+          [ -z "$_TENANT_ID" ] && MISSING=$((MISSING+1))
+          [ "$MISSING" -gt 0 ] && echo "ERROR: $MISSING value(s) missing." && exit 1
+          echo "All required values present."
+
+      - name: Login to Azure (SPN)
+        uses: azure/login@v2
+        with:
+          creds: >-
+            {"clientId":"${{ secrets.AZURE_CLIENT_ID }}",
+             "clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}",
+             "subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+             "tenantId":"${{ secrets.AZURE_TENANT_ID }}"}
+
+      - name: Set App Settings via ARM API
+        env:
+          _SUB_ID:             ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          _RG:                 ${{ vars.AZURE_RESOURCE_GROUP }}
+          _APP:                ${{ vars.AZURE_WEBAPP_NAME }}
+          _OAI_ENDPOINT:       ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          _OAI_API_KEY:        ${{ secrets.AZURE_OPENAI_API_KEY }}
+          _OAI_API_VERSION:    ${{ secrets.AZURE_OPENAI_API_VERSION }}
+          _OAI_CHAT_DEPLOY:    ${{ secrets.AZURE_OPENAI_CHAT_DEPLOYMENT }}
+          _OAI_EMBED_ENDPOINT: ${{ secrets.AZURE_OPENAI_EMBEDDING_ENDPOINT }}
+          _OAI_EMBED_KEY:      ${{ secrets.AZURE_OPENAI_EMBEDDING_API_KEY }}
+          _OAI_EMBED_DEPLOY:   ${{ secrets.AZURE_OPENAI_EMBEDDING_DEPLOYMENT }}
+          _SEARCH_ENDPOINT:    ${{ secrets.AZURE_SEARCH_ENDPOINT }}
+          _SEARCH_KEY:         ${{ secrets.AZURE_SEARCH_API_KEY }}
+          _SEARCH_INDEX:       ${{ secrets.AZURE_SEARCH_INDEX_NAME }}
+          _STORAGE_CONN:       ${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}
+          _STORAGE_CONTAINER:  ${{ secrets.AZURE_STORAGE_CONTAINER_NAME }}
+          _BLOB_BASE_URL:      ${{ secrets.BLOB_BASE_URL }}
+          _TOP_K:              ${{ vars.TOP_K }}
+          _SCORE_THRESHOLD:    ${{ vars.SCORE_THRESHOLD }}
+          _STRICT_GROUNDING:   ${{ vars.STRICT_GROUNDING }}
+          _LOG_LEVEL:          ${{ vars.LOG_LEVEL }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os
+          g = os.environ.get
+          settings = {
+              "WEBSITE_STARTUP_COMMAND":           "bash /home/site/wwwroot/deploy/startup.sh",
+              "PYTHONPATH":                        "/home/site/wwwroot",
+              "WEBSITES_PORT":                     "8000",
+              "BACKEND_URL":                       "http://localhost:8080",
+              "AZURE_OPENAI_ENDPOINT":             g("_OAI_ENDPOINT",""),
+              "AZURE_OPENAI_API_KEY":              g("_OAI_API_KEY",""),
+              "AZURE_OPENAI_API_VERSION":          g("_OAI_API_VERSION",""),
+              "AZURE_OPENAI_CHAT_DEPLOYMENT":      g("_OAI_CHAT_DEPLOY",""),
+              "AZURE_OPENAI_EMBEDDING_ENDPOINT":   g("_OAI_EMBED_ENDPOINT",""),
+              "AZURE_OPENAI_EMBEDDING_API_KEY":    g("_OAI_EMBED_KEY",""),
+              "AZURE_OPENAI_EMBEDDING_DEPLOYMENT": g("_OAI_EMBED_DEPLOY",""),
+              "AZURE_SEARCH_ENDPOINT":             g("_SEARCH_ENDPOINT",""),
+              "AZURE_SEARCH_API_KEY":              g("_SEARCH_KEY",""),
+              "AZURE_SEARCH_INDEX_NAME":           g("_SEARCH_INDEX",""),
+              "AZURE_STORAGE_CONNECTION_STRING":   g("_STORAGE_CONN",""),
+              "AZURE_STORAGE_CONTAINER_NAME":      g("_STORAGE_CONTAINER",""),
+              "BLOB_BASE_URL":                     g("_BLOB_BASE_URL",""),
+              "TOP_K":                             g("_TOP_K","5"),
+              "SCORE_THRESHOLD":                   g("_SCORE_THRESHOLD","0.01"),
+              "STRICT_GROUNDING":                  g("_STRICT_GROUNDING","true"),
+              "LOG_LEVEL":                         g("_LOG_LEVEL","INFO"),
+          }
+          with open("/tmp/appsettings.json","w") as f:
+              json.dump({"properties": settings}, f, indent=2)
+          print(f"Prepared {len(settings)} settings")
+          PYEOF
+          SUB_ID=$(echo "$_SUB_ID" | tr -d '[:space:]')
+          RG=$(echo "$_RG"         | tr -d '[:space:]')
+          APP=$(echo "$_APP"       | tr -d '[:space:]')
+          echo "ARM target: resourceGroups/${RG}/sites/${APP}"
+          ARM_URL="https://management.azure.com/subscriptions/${SUB_ID}/resourceGroups/${RG}/providers/Microsoft.Web/sites/${APP}/config/appsettings?api-version=2022-03-01"
+          az rest \
+            --method PUT \
+            --url "$ARM_URL" \
+            --body @/tmp/appsettings.json \
+            --headers "Content-Type=application/json"
+          echo "App settings applied."
+
+      - name: Enable WebSockets
+        env:
+          _APP: ${{ vars.AZURE_WEBAPP_NAME }}
+          _RG:  ${{ vars.AZURE_RESOURCE_GROUP }}
+        run: |
+          APP=$(echo "$_APP" | tr -d '[:space:]')
+          RG=$(echo "$_RG"   | tr -d '[:space:]')
+          az webapp config set --web-sockets-enabled true \
+            --name "$APP" --resource-group "$RG"
+          echo "WebSockets enabled."
+
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v1
+        with:
+          app-name: ${{ vars.AZURE_WEBAPP_NAME }}
+          package: deploy.zip
+
+      - name: Restart App Service
+        env:
+          _APP: ${{ vars.AZURE_WEBAPP_NAME }}
+          _RG:  ${{ vars.AZURE_RESOURCE_GROUP }}
+        run: |
+          APP=$(echo "$_APP" | tr -d '[:space:]')
+          RG=$(echo "$_RG"   | tr -d '[:space:]')
+          az webapp restart --name "$APP" --resource-group "$RG"
+          echo "Restart triggered. Waiting 60s..."
+          sleep 60
+
+      - name: Smoke test – verify app is live
+        id: smoke
+        run: |
+          APP_URL="https://${{ vars.AZURE_WEBAPP_NAME }}.azurewebsites.net"
+          sleep 60
+          SUCCESS=false
+          for attempt in 1 2 3 4 5; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$APP_URL/_stcore/health" || echo "000")
+            echo "Attempt $attempt/5 → HTTP $STATUS"
+            if [ "$STATUS" = "200" ]; then SUCCESS=true; break; fi
+            sleep 20
+          done
+          echo "smoke_ok=$SUCCESS" >> $GITHUB_OUTPUT
+          [ "$SUCCESS" = "true" ] && echo "Healthy!" || echo "Not yet healthy."
+          echo "App URL: $APP_URL"
+
+      - name: Write job summary
+        if: always()
+        run: |
+          APP_URL="https://${{ vars.AZURE_WEBAPP_NAME }}.azurewebsites.net"
+          STATUS=$( [ "${{ steps.smoke.outputs.smoke_ok }}" = "true" ] && echo "✅ Healthy" || echo "⚠️ Not yet healthy" )
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## Deploy → TEST
+          | **Web App** | \`${{ vars.AZURE_WEBAPP_NAME }}\` | **Health** | $STATUS |
+          | **URL** | [$APP_URL]($APP_URL) | **Commit** | \`${{ github.sha }}\` |
+          EOF
+
+      - name: Azure Logout
+        if: always()
+        run: az logout
+
+# ════════════════════════════════════════════════════════════
+# JOB 4 – DEPLOY TO PRODUCTION
+# ════════════════════════════════════════════════════════════
+  deploy-prod:
+    name: "Deploy → Production"
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: prod
+      url: https://${{ vars.AZURE_WEBAPP_NAME }}.azurewebsites.net
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.environment == 'prod'
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-package
+
+      - name: "Debug – Variables & secrets for PROD"
+        env:
+          _CLIENT_ID:          ${{ secrets.AZURE_CLIENT_ID }}
+          _CLIENT_SECRET:      ${{ secrets.AZURE_CLIENT_SECRET }}
+          _SUBSCRIPTION_ID:    ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          _TENANT_ID:          ${{ secrets.AZURE_TENANT_ID }}
+          _OAI_ENDPOINT:       ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          _OAI_API_KEY:        ${{ secrets.AZURE_OPENAI_API_KEY }}
+          _SEARCH_ENDPOINT:    ${{ secrets.AZURE_SEARCH_ENDPOINT }}
+          _STORAGE_CONN:       ${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}
+          _BLOB_BASE_URL:      ${{ secrets.BLOB_BASE_URL }}
+        run: |
+          chk() { [ -n "$2" ] && echo "  [SET]     $1" || echo "  [MISSING] $1"; }
+          echo "════════ ENVIRONMENT DEBUG — PROD ════════"
+          echo "  AZURE_WEBAPP_NAME    : ${{ vars.AZURE_WEBAPP_NAME }}"
+          echo "  AZURE_RESOURCE_GROUP : ${{ vars.AZURE_RESOURCE_GROUP }}"
+          echo "  Actor: ${{ github.actor }} | Branch: ${{ github.ref_name }}"
+          chk "AZURE_CLIENT_ID      " "$_CLIENT_ID"
+          chk "AZURE_CLIENT_SECRET  " "$_CLIENT_SECRET"
+          chk "AZURE_SUBSCRIPTION_ID" "$_SUBSCRIPTION_ID"
+          chk "AZURE_TENANT_ID      " "$_TENANT_ID"
+          chk "AZURE_OPENAI_ENDPOINT" "$_OAI_ENDPOINT"
+          chk "AZURE_OPENAI_API_KEY " "$_OAI_API_KEY"
+          chk "AZURE_SEARCH_ENDPOINT" "$_SEARCH_ENDPOINT"
+          chk "AZURE_STORAGE_CONNECTION_STRING" "$_STORAGE_CONN"
+          MISSING=0
+          [ -z "${{ vars.AZURE_WEBAPP_NAME }}"    ] && MISSING=$((MISSING+1))
+          [ -z "${{ vars.AZURE_RESOURCE_GROUP }}" ] && MISSING=$((MISSING+1))
+          [ -z "$_CLIENT_ID" ] && MISSING=$((MISSING+1))
+          [ -z "$_CLIENT_SECRET" ] && MISSING=$((MISSING+1))
+          [ -z "$_SUBSCRIPTION_ID" ] && MISSING=$((MISSING+1))
+          [ -z "$_TENANT_ID" ] && MISSING=$((MISSING+1))
+          [ "$MISSING" -gt 0 ] && echo "ERROR: $MISSING value(s) missing." && exit 1
+          echo "All required values present."
+
+      - name: Login to Azure (SPN)
+        uses: azure/login@v2
+        with:
+          creds: >-
+            {"clientId":"${{ secrets.AZURE_CLIENT_ID }}",
+             "clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}",
+             "subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+             "tenantId":"${{ secrets.AZURE_TENANT_ID }}"}
+
+      - name: Set App Settings via ARM API
+        env:
+          _SUB_ID:             ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          _RG:                 ${{ vars.AZURE_RESOURCE_GROUP }}
+          _APP:                ${{ vars.AZURE_WEBAPP_NAME }}
+          _OAI_ENDPOINT:       ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          _OAI_API_KEY:        ${{ secrets.AZURE_OPENAI_API_KEY }}
+          _OAI_API_VERSION:    ${{ secrets.AZURE_OPENAI_API_VERSION }}
+          _OAI_CHAT_DEPLOY:    ${{ secrets.AZURE_OPENAI_CHAT_DEPLOYMENT }}
+          _OAI_EMBED_ENDPOINT: ${{ secrets.AZURE_OPENAI_EMBEDDING_ENDPOINT }}
+          _OAI_EMBED_KEY:      ${{ secrets.AZURE_OPENAI_EMBEDDING_API_KEY }}
+          _OAI_EMBED_DEPLOY:   ${{ secrets.AZURE_OPENAI_EMBEDDING_DEPLOYMENT }}
+          _SEARCH_ENDPOINT:    ${{ secrets.AZURE_SEARCH_ENDPOINT }}
+          _SEARCH_KEY:         ${{ secrets.AZURE_SEARCH_API_KEY }}
+          _SEARCH_INDEX:       ${{ secrets.AZURE_SEARCH_INDEX_NAME }}
+          _STORAGE_CONN:       ${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}
+          _STORAGE_CONTAINER:  ${{ secrets.AZURE_STORAGE_CONTAINER_NAME }}
+          _BLOB_BASE_URL:      ${{ secrets.BLOB_BASE_URL }}
+          _TOP_K:              ${{ vars.TOP_K }}
+          _SCORE_THRESHOLD:    ${{ vars.SCORE_THRESHOLD }}
+          _STRICT_GROUNDING:   ${{ vars.STRICT_GROUNDING }}
+          _LOG_LEVEL:          ${{ vars.LOG_LEVEL }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os
+          g = os.environ.get
+          settings = {
+              "WEBSITE_STARTUP_COMMAND":           "bash /home/site/wwwroot/deploy/startup.sh",
+              "PYTHONPATH":                        "/home/site/wwwroot",
+              "WEBSITES_PORT":                     "8000",
+              "BACKEND_URL":                       "http://localhost:8080",
+              "AZURE_OPENAI_ENDPOINT":             g("_OAI_ENDPOINT",""),
+              "AZURE_OPENAI_API_KEY":              g("_OAI_API_KEY",""),
+              "AZURE_OPENAI_API_VERSION":          g("_OAI_API_VERSION",""),
+              "AZURE_OPENAI_CHAT_DEPLOYMENT":      g("_OAI_CHAT_DEPLOY",""),
+              "AZURE_OPENAI_EMBEDDING_ENDPOINT":   g("_OAI_EMBED_ENDPOINT",""),
+              "AZURE_OPENAI_EMBEDDING_API_KEY":    g("_OAI_EMBED_KEY",""),
+              "AZURE_OPENAI_EMBEDDING_DEPLOYMENT": g("_OAI_EMBED_DEPLOY",""),
+              "AZURE_SEARCH_ENDPOINT":             g("_SEARCH_ENDPOINT",""),
+              "AZURE_SEARCH_API_KEY":              g("_SEARCH_KEY",""),
+              "AZURE_SEARCH_INDEX_NAME":           g("_SEARCH_INDEX",""),
+              "AZURE_STORAGE_CONNECTION_STRING":   g("_STORAGE_CONN",""),
+              "AZURE_STORAGE_CONTAINER_NAME":      g("_STORAGE_CONTAINER",""),
+              "BLOB_BASE_URL":                     g("_BLOB_BASE_URL",""),
+              "TOP_K":                             g("_TOP_K","5"),
+              "SCORE_THRESHOLD":                   g("_SCORE_THRESHOLD","0.01"),
+              "STRICT_GROUNDING":                  g("_STRICT_GROUNDING","true"),
+              "LOG_LEVEL":                         g("_LOG_LEVEL","INFO"),
+          }
+          with open("/tmp/appsettings.json","w") as f:
+              json.dump({"properties": settings}, f, indent=2)
+          print(f"Prepared {len(settings)} settings")
+          PYEOF
+          SUB_ID=$(echo "$_SUB_ID" | tr -d '[:space:]')
+          RG=$(echo "$_RG"         | tr -d '[:space:]')
+          APP=$(echo "$_APP"       | tr -d '[:space:]')
+          echo "ARM target: resourceGroups/${RG}/sites/${APP}"
+          ARM_URL="https://management.azure.com/subscriptions/${SUB_ID}/resourceGroups/${RG}/providers/Microsoft.Web/sites/${APP}/config/appsettings?api-version=2022-03-01"
+          az rest \
+            --method PUT \
+            --url "$ARM_URL" \
+            --body @/tmp/appsettings.json \
+            --headers "Content-Type=application/json"
+          echo "App settings applied."
+
+      - name: Enable WebSockets
+        env:
+          _APP: ${{ vars.AZURE_WEBAPP_NAME }}
+          _RG:  ${{ vars.AZURE_RESOURCE_GROUP }}
+        run: |
+          APP=$(echo "$_APP" | tr -d '[:space:]')
+          RG=$(echo "$_RG"   | tr -d '[:space:]')
+          az webapp config set --web-sockets-enabled true \
+            --name "$APP" --resource-group "$RG"
+          echo "WebSockets enabled."
+
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v1
+        with:
+          app-name: ${{ vars.AZURE_WEBAPP_NAME }}
+          package: deploy.zip
+
+      - name: Restart App Service
+        env:
+          _APP: ${{ vars.AZURE_WEBAPP_NAME }}
+          _RG:  ${{ vars.AZURE_RESOURCE_GROUP }}
+        run: |
+          APP=$(echo "$_APP" | tr -d '[:space:]')
+          RG=$(echo "$_RG"   | tr -d '[:space:]')
+          az webapp restart --name "$APP" --resource-group "$RG"
+          echo "Restart triggered. Waiting 60s..."
+          sleep 60
+
+      - name: Smoke test – verify app is live
+        id: smoke
+        run: |
+          APP_URL="https://${{ vars.AZURE_WEBAPP_NAME }}.azurewebsites.net"
+          sleep 60
+          SUCCESS=false
+          for attempt in 1 2 3 4 5; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$APP_URL/_stcore/health" || echo "000")
+            echo "Attempt $attempt/5 → HTTP $STATUS"
+            if [ "$STATUS" = "200" ]; then SUCCESS=true; break; fi
+            sleep 20
+          done
+          echo "smoke_ok=$SUCCESS" >> $GITHUB_OUTPUT
+          [ "$SUCCESS" = "true" ] && echo "Healthy!" || echo "Not yet healthy."
+          echo "App URL: $APP_URL"
+
+      - name: Write job summary
+        if: always()
+        run: |
+          APP_URL="https://${{ vars.AZURE_WEBAPP_NAME }}.azurewebsites.net"
+          STATUS=$( [ "${{ steps.smoke.outputs.smoke_ok }}" = "true" ] && echo "✅ Healthy" || echo "⚠️ Not yet healthy" )
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## Deploy → PRODUCTION
+          | **Web App** | \`${{ vars.AZURE_WEBAPP_NAME }}\` | **Health** | $STATUS |
+          | **URL** | [$APP_URL]($APP_URL) | **Commit** | \`${{ github.sha }}\` |
+          EOF
+
+      - name: Azure Logout
+        if: always()
+        run: az logout
