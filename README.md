@@ -36,7 +36,7 @@ docker compose up            # UI + API locally
 ```
 
 ## Roadmap
-- **Eval quality gate** — run the `mangos-rag-eval` suite in CI and block merge on regression.
+- **Eval quality gate** — run the [rag-evaluation-harness-python](https://github.com/srikanthot/rag-evaluation-harness-python) suite in CI and block merge on regression.
 - Bicep/Terraform IaC; a parallel AWS deploy job.
 
 ---
